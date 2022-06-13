@@ -1,0 +1,425 @@
+---
+title: "Midterm_Project"
+author: "212STG04"
+date: '2022 5 15 '
+output:
+  word_document:
+    toc: yes
+  html_document:
+    toc: yes
+    toc_float: yes
+---
+
+```{r setup, include=FALSE,eval = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(reticulate)
+use_python('C:/Users/jinny/AppData/Local/Programs/Python/Python310/python.exe')
+
+virtualenv_create("mid-proj")
+py_install( packages = c("pandas","numpy", "sklearn", "torch", "matplotlib"),
+            envname="mid-proj")
+use_virtualenv("mid-proj")
+```
+
+```{python, include=FALSE,eval = FALSE}
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+```
+
+```{r include=FALSE,eval = FALSE}
+library(tidyverse)
+options("scipen" = 100)
+knitr::opts_knit$set(root.dir = "C:/temp/2022/insurance_model")
+library(lme4)
+library(rstan)
+library(faraway)
+library(flextable)
+library(boot)
+library(MASS) 
+library(caret)
+library(stats)
+library(pscl)
+library(bayesplot)
+```
+
+# 0. create data 
+
+```{python,eval = FALSE}
+
+np.random.seed(2022)
+
+
+nYear=11
+sample_size=150000
+param_beta = np.array([-3.0, 1.0, 2.5])
+p = len(param_beta) # number of explanatory variable including 1
+para = pd.Series({'beta': param_beta, 'phi': 0.9, 'sig': 0.5})
+
+X1 = np.stack((np.ones(shape=[sample_size,nYear]),
+              np.random.binomial(n=1, p=0.5, size=[sample_size, nYear]),
+              np.random.binomial(n=1, p=0.5, size=[sample_size, nYear])),
+              axis=1)
+X_sim = X1
+
+X_sim = np.transpose(X1, [0,2,1])
+
+lamb = np.exp(np.matmul(X_sim, para['beta'][:, np.newaxis]))
+# print('lamb shape', lamb.shape)
+
+
+
+#lambda, R, n
+
+sig = para['sig']
+phi = para['phi']
+n = np.full((sample_size, nYear), 999)
+Rhat = np.full((sample_size, nYear), 0.0)
+c_mean=-sig/np.sqrt(1-phi**2)/2
+for i in range(sample_size):
+    for t in range(nYear):
+        if t==0:
+            Rhat[i,t] = np.random.normal(c_mean, sig/np.sqrt(1-phi**2), size=1) #= phi*R0[i] + epsilon[i,1]
+        else:
+            Rhat[i,t] = np.random.normal((Rhat[i,t-1]-c_mean)*phi, sig, size=1) +c_mean
+            
+        n[i,t] = np.random.poisson(lam=lamb[i,t]*np.exp(Rhat[i,t]), size=1) #rpois(1, mu_n )
+
+N_sim=n
+lamb_sim = lamb
+
+# print('N_sim shape', N_sim.shape)
+# print('lamb_sim shape', lamb_sim.shape) 
+
+```
+
+
+You are given the following data
+
+* N_sim: claim history of size [sample_size, 11]
+* lamb_sim: true priori rate of size [sample_size, 11, 1]
+* X_sim: explanatory variables of size [sample_size, 11, 3]
+* Train:valid:test = 5:1:4
+
+```{python,eval = FALSE}
+
+#print(N_sim.shape, lamb_sim.shape, X_sim.shape)
+np.unique(lamb_sim)
+
+Y = torch.tensor(N_sim[:,:,np.newaxis ], dtype=torch.float32) #shape: [none, 11, 1], #time t1~t11
+LAMB = torch.tensor(lamb_sim, dtype=torch.float32)
+
+N_train = int(sample_size*0.5)
+N_valid = int(sample_size*0.6)
+N_test  = int(sample_size*1.0)
+
+y_future_train, lamb_future_train, y_current_train, lamb_current_train =  Y[:N_train, 1:, :], LAMB[:N_train, 1:, :], Y[:N_train,:-1, :], LAMB[:N_train,:-1, :]
+y_future_valid, lamb_future_valid, y_current_valid, lamb_current_valid =  Y[N_train:N_valid, 1:, :], LAMB[N_train:N_valid, 1:, :], Y[N_train:N_valid,:-1, :], LAMB[N_train:N_valid,:-1, :]
+y_future_test, lamb_future_test, y_current_test, lamb_current_test =  Y[N_valid:, 1:, :], LAMB[N_valid:, 1:, :], Y[N_valid:,:-1, :], LAMB[N_valid:,:-1, :]
+
+# input 
+input_current_train = torch.concat([y_current_train, lamb_current_train], axis=2)
+input_current_valid = torch.concat([y_current_valid, lamb_current_valid], axis=2)
+input_current_test = torch.concat([y_current_test, lamb_current_test], axis=2)
+
+X_future_train, X_current_train =  X_sim[:N_train, 1:, :],  X_sim[:N_train,:-1, :]
+X_future_test, X_current_test = X_sim[N_valid:, 1:, :],  X_sim[N_valid:,:-1, :]
+
+
+# reshape 
+X_future_train_reshape = X_future_train.reshape(75000*10,3)
+X_future_test_reshape = X_future_test.reshape(60000*10,3)
+X_current_train_reshape = X_current_train.reshape(75000*10,3)
+X_current_test_reshape = X_current_test.reshape(60000*10,3)
+
+y_future_train_reshape = y_future_train.reshape(75000*10)
+y_future_test_reshape = y_future_test.reshape(60000*10)
+
+y_future_train_reshape = y_future_train_reshape.tolist()
+y_future_test_reshape = y_future_test_reshape.tolist()
+
+```
+
+# Problem 1: Worst Model 
+
+Worst model is to use population mean as a predictor regardless of explanatory variables or past observations. Calculate the test MSE.
+
+```{python,eval = FALSE}
+
+pred1 = torch.mean(y_future_test)
+mse1 = torch.mean(( pred1 - y_future_test)**2)
+mse1 = np.array(mse1) 
+mse1
+
+```
+
+
+
+# Problem 2: GLM 
+
+Train Poisson GLM with train data, and calculate the test MSE. (Use X but do not use lambda)
+
+```{r,eval = FALSE}
+
+# train 
+Y_train <- data.frame(y=py$y_future_train_reshape)
+X_train <- data.frame(py$X_future_train_reshape[,2:3])
+train_glm <- data.frame(Y_train,X_train)
+
+# test 
+Y_test <- data.frame(y=py$y_future_test_reshape)
+X_test <- data.frame(py$X_future_test_reshape[,2:3])
+test_glm <- data.frame(Y_test,X_test)
+
+# glm model & predict 
+mod_glm <- glm(y ~ ., data = train_glm ,family=poisson)
+pred_glm <-predict(mod_glm, newdata = test_glm, type= "response")
+mse2 <- mean((pred_glm - Y_test)$y^2)
+mse2
+
+```
+
+# Problem 3: State space model
+
+Train Poisson-Gamma AR(1) State space model with first 2000 train data, and calculate the test MSE using first 2000 test data. It is okay for you to use STAN in R. (It is okay to use lambda rather than using X.)
+
+```{python,eval = FALSE}
+
+y_future_test_reshape = y_future_test.reshape(60000,10)
+y_current_test_reshape = y_current_test.reshape(60000,10)
+lamb_test_reshape = LAMB[N_valid:,:, :].reshape(60000,11)
+
+y_current_test_reshape = pd.DataFrame(y_current_test_reshape.numpy())
+lamb_test_reshape = pd.DataFrame(lamb_test_reshape.numpy())
+y_future_test_reshape = pd.DataFrame(y_future_test_reshape.numpy())
+
+
+```
+
+```{r,eval = FALSE}
+
+# Make Data for SSM 
+col <- c()
+for (i in 1:11){col1 <- paste0("T",i) ; col[i] <- col1} 
+
+names(py$y_current_test_reshape) <- col[1:10]
+names(py$lamb_test_reshape) <- col
+
+Y <- as.matrix(py$y_current_test_reshape)
+Lam <- as.matrix(py$lamb_test_reshape)
+
+T = 11
+n=2000
+
+dat <- list(T=T, n = n, Y = Y[1:2000,], lambda = Lam[1:2000,]) 
+```
+
+
+```{R,eval = FALSE}
+
+#Stan
+
+model_code = "
+data{
+  int n;
+  int T;
+  int Y[n, T-1];
+  matrix[n, T] lambda;
+  
+}
+
+parameters {
+  real R1[n];
+  real<lower=0,upper=1> B[n, T];
+  real<lower=0> G[n, T];
+  real<lower=0> r;
+  real rho;
+}
+
+transformed parameters {
+  real R[n, T];
+  
+  for(i in 1:n){
+  
+    R[i,1] = R1[i];
+    
+    for(t in 2:T){
+    
+    R[i,t] = B[i,t] * R[i,t-1] + G[i,t];
+    
+    }
+  }
+}
+
+
+model {
+for(i in 1:n){
+  R1[i] ~ gamma(r,r); 
+  
+  for(t in 1:T){
+    B[i,t] ~ beta(r*rho,r*(1-rho));
+    G[i,t] ~ gamma(r*(1-rho),r);
+  }
+}
+
+for(i in 1:n){
+  for(t in 1:(T-1)){
+    Y[i,t] ~ poisson( lambda[i,t]*R[i,t] );
+  }
+}
+  r ~ uniform(0,100);
+  rho ~ uniform(0,1);
+}
+
+"
+
+initial.R1 <- rep(1,n) 
+my_init <- function(...) list(r=1, rho=0.3, R1 = initial.R1)
+
+stanmodel<-stan_model(model_code=model_code)
+fit <-sampling(stanmodel, data=dat, pars=c("rho","r"), seed = 2022 ,iter=120, warmup=20,
+                chains=3, init = my_init)
+
+print(fit)
+# stan_diag(fit)
+# stan_hist(fit)
+stan_trace(fit,pars=c("rho","r"))
+
+```
+
+
+```{r,eval = FALSE}
+
+ext_fit <- extract(fit)
+ext_fit$rho -> rho_hat 
+ext_fit$r  -> gamma_hat 
+rho <- median(rho_hat)
+gamma <- median(gamma_hat)
+
+list(rho = rho, gamma = gamma)%>% data.frame() %>%
+  flextable()%>%
+  align_text_col( align = "center") %>% 
+  set_caption(caption = "#3. Random effext: rho & gamma")
+
+
+dat2 <- list(T=T, n = n, Y = Y[1:2000,], lambda = Lam[1:2000,], r = gamma , rho = rho) 
+
+model_code2 = "
+data{
+  int n;
+  int T;
+  int Y[n, T-1];
+  matrix[n, T] lambda;
+  real r;
+  real rho;
+  
+}
+
+parameters {
+  real R1[n];
+  real<lower=0,upper=1> B[n, T];
+  real<lower=0> G[n, T];
+}
+
+transformed parameters {
+  real R[n, T];
+  
+  for(i in 1:n){
+  
+    R[i,1] = R1[i];
+    
+    for(t in 2:T){
+    
+    R[i,t] = B[i,t] * R[i,t-1] + G[i,t];
+    
+    }
+  }
+}
+
+
+model {
+for(i in 1:n){
+  R1[i] ~ gamma(r,r); 
+  
+  for(t in 1:T){
+    B[i,t] ~ beta(r*rho,r*(1-rho));
+    G[i,t] ~ gamma(r*(1-rho),r);
+  }
+}
+
+for(i in 1:n){
+  for(t in 1:(T-1)){
+    Y[i,t] ~ poisson( lambda[i,t]*R[i,t] );
+  }
+}
+  r ~ uniform(0,100);
+  rho ~ uniform(0,1);
+}
+
+generated quantities {
+  real return_hidden_1[n,T-1];
+  
+  for (i in 1:n){
+  
+     for (t in 2:T){
+     
+     return_hidden_1[i,t-1] = R[i,t];
+    
+     }
+  }
+}
+
+"
+
+my_init <- function(...) list(R1 = initial.R1)
+stanmodel2<-stan_model(model_code=model_code2)
+
+iter = 300
+warmup = 10
+chains = 2
+
+fit2 <-sampling(stanmodel2, data=dat2, pars=c("return_hidden_1"), seed = 2022 , iter=iter, warmup=warmup,
+                chains=chains, init = my_init)
+
+stan_trace(fit2,pars=c("return_hidden_1"))
+extract(fit2, 'return_hidden_1')$return_hidden_1 -> R_hat
+
+
+# Predict 
+
+tot <- (iter - warmup) * chains
+theta_hat<- matrix(NA,n,T-1)
+
+for (i in 1:n){
+  for (t in 1:10){
+    
+    theta_hat[i,t] <- sum(R_hat[,i,t])/tot
+    
+  }
+}
+
+pred3 <- Lam[1:2000,2:11] * theta_hat
+mse3 <- mean(( as.matrix(py$y_future_test_reshape[1:2000,]) - pred3)^2)
+mse3
+
+
+```
+
+
+
+# All Test MSE 
+```{r,eval = FALSE}
+
+list(Worst = as.double(py$mse1), glm = mse2, SSM = mse3) %>% data.frame() %>% round(3) %>%
+  flextable()%>%
+  align_text_col( align = "center") %>% 
+  set_caption(caption = "MSE of All models")
+
+
+```
+
+
